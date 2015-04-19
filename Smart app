@@ -1,0 +1,136 @@
+
+/**
+ *  Notify Me If Open and On
+ *
+ *  Author: Journeymnn
+ */
+definition(
+	name: "Notify Me If Open and On",
+	namespace: "Journeymnn",
+	author: "Journeymnn",
+	description: "Get a push message sent to your phone when power is flowing through a meter and any contact sensor is open too long.",
+	category: "Green Living",
+	iconUrl: "https://s3.amazonaws.com/smartapp-icons/Meta/text.png",
+	iconX2Url: "https://s3.amazonaws.com/smartapp-icons/Meta/text@2x.png"
+)
+
+preferences {
+	section{
+		input(name: "meter", type: "capability.powerMeter", title: "When this power meter...", required: true, description: null)
+		input(name: "powerThreshold", type: "number", title: "reports more watts than...", description: "10")
+	}
+	section("When any of these contacts are open..."){
+		input "contacts", "capability.contactSensor", title: "Where?", required:true, multiple:true
+                input "openThreshold", "number", title: "For how many minutes?", description: "1", required: true
+	}
+
+        section("Notifications") {
+                input("recipients", "contact", title: "Send notifications to") {
+                input(name: "sms", type: "phone", title: "Send A Text To", description: null, required: false)
+                input(name: "pushNotification", type: "bool", title: "Send a push notification", description: null, defaultValue: true)
+        }
+    }
+}
+
+def installed()
+{
+    log.debug "Installed with settings: ${settings}"
+	initialize()
+}
+
+def updated()
+{
+	log.debug "Updated with settings: ${settings}"
+	unsubscribe()
+	initialize()
+}
+
+
+def initialize() {
+	subscribe(meter, "power", meterHandler)
+    subscribe(contacts, "contact.open", contactOpen)
+	subscribe(contacts, "contact.closed", contactClosed)
+
+}
+
+def meterHandler(evt) {
+	
+	//initialize msgSent flag for contacts open at beginning
+	if (!atomicState.startMsgSent) { atomicState.startMsgSent = false}
+	def startMsgSent = atomicState.startMsgSent as boolean
+	
+	//define meterValue 
+	def meterValue = evt.value as double
+	log.debug "meter value is ${meterValue}"
+
+	if (meterValue > powerThreshold) { //power exceeds threshold
+		state.PowerOn = true
+		log.debug "the threshold (${powerThreshold}) has been crossed" 
+		// find open contacts
+		def contactState = contacts.currentState("contact") 
+		def openContacts = contacts[contactState.value.findIndexValues {it == "open"}]
+        if(openContacts.size() >0){
+        		def msg = "Alert: ${meter} is now on and these are open: ${openContacts}."
+				log.debug "${msg}"
+				if(startMsgSent == false) { //only send message once for each power on cycle
+					sendMessage(msg)
+            		log.debug "Message sent"
+					atomicState.startMsgSent = true
+				}
+        }
+	} else {  //power does not exceed threshold
+		atomicState.startMsgSent = false
+		state.PowerOn = false
+	}
+
+}
+
+
+def contactOpen(evt)
+{
+	//any time something opens when power is on, call handler after delay
+	if(state.PowerOn == true){
+		log.trace "contactOpen($evt.name: $evt.value)"
+		def delay = openThreshold * 60
+		runIn(delay, contactOpenTooLong, [overwrite: false])
+	}
+}
+
+def contactClosed(evt)
+{
+	log.trace "contactClosed($evt.name: $evt.value)"
+}
+
+def contactOpenTooLong() {
+	if(state.PowerOn == true){
+		def contactState = contacts.currentState("contact")
+		def contactThreshold = openThreshold * 60000 - 1000
+		if (contactState.value.any {it == "open"}) { //execute if any contacts are open
+			def openContacts = contacts[contactState.value.findIndexValues {it == "open"}] //find which contacts are open
+			def elapsed = contactState.rawDateCreated.time.collect {now() - it} //find elapsed time
+			def elapsedOpen = elapsed[contactState.value.findIndexValues {it == "open"}] //find elapsed time of open contacts
+            log.debug "elapsedOpen is ${elapsedOpen}"
+			if (elapsedOpen.any {it >= contactThreshold}) {
+				def elapsedLong = openContacts[elapsedOpen.findIndexValues{it >= contactThreshold}]
+				def msg = "The following contacts have been open longer than $openThreshold minutes while $meter is on: ${elapsedLong}."
+				sendMessage(msg)
+			} else { log.debug "No contact has stayed open long enough, so doing nothing" }
+		} else { log.warn "contactOpenTooLong() called but all contacts are closed, so doing nothing" }
+	} else { log.warn "contactOpenTooLong() called but power is off, so doing nothing" }
+
+}
+
+def sendMessage(msg) {
+    if (location.contactBookEnabled) {
+        sendNotificationToContacts(msg, recipients)
+    }
+    else {
+        if (sms) {
+            sendSms(sms, msg)
+        }
+        if (pushNotification) {
+            sendPush(msg)
+        }
+    }
+
+}
